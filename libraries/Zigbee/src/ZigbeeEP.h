@@ -137,6 +137,7 @@ public:
   virtual void zbAttributeRead(uint16_t cluster_id, const esp_zb_zcl_attribute_t *attribute, uint8_t src_endpoint, esp_zb_zcl_addr_t src_address) {};
   virtual void zbReadBasicCluster(const esp_zb_zcl_attribute_t *attribute);  //already implemented
   virtual void zbIdentify(const esp_zb_zcl_set_attr_value_message_t *message);
+  virtual void zbOTAState(bool otaActive);
   virtual void zbWindowCoveringMovementCmd(const esp_zb_zcl_window_covering_movement_message_t *message) {};
   virtual void zbReadTimeCluster(const esp_zb_zcl_attribute_t *attribute);  //already implemented
   virtual void zbIASZoneStatusChangeNotification(const esp_zb_zcl_ias_zone_status_change_notification_message_t *message) {};
@@ -164,6 +165,11 @@ public:
     _on_default_response = callback;
   }
 
+  void onOTAStateChange(void (*callback)(bool state)) {
+    _on_ota_state_change = callback;
+  }
+  
+
   // Convert ZCL status to name
 
 private:
@@ -171,6 +177,7 @@ private:
   char *_read_model;
   void (*_on_identify)(uint16_t time);
   void (*_on_default_response)(zb_cmd_type_t resp_to_cmd, esp_zb_zcl_status_t status);
+  void (*_on_ota_state_change)(bool state);
   time_t _read_time;
   int32_t _read_timezone;
 

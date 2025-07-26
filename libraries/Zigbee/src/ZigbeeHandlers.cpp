@@ -292,6 +292,9 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
     switch (message->upgrade_status) {
       case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
         log_i("Zigbee - OTA upgrade start");
+        for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+          (*it)->zbOTAState(true);  // Notify that OTA is active
+        }
         start_time = esp_timer_get_time();
         s_ota_partition = esp_ota_get_next_update_partition(NULL);
         assert(s_ota_partition);
@@ -324,6 +327,9 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
 #endif
           if (ret != ESP_OK) {
             log_e("Zigbee - Failed to write OTA data to partition, status: %s", esp_err_to_name(ret));
+            for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+              (*it)->zbOTAState(false);  // Notify that OTA is no longer active
+            }
             return ret;
           }
         }
@@ -350,12 +356,21 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
 #endif
         if (ret != ESP_OK) {
           log_e("Zigbee - Failed to end OTA partition, status: %s", esp_err_to_name(ret));
+          for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+            (*it)->zbOTAState(false);  // Notify that OTA is no longer active
+          }
           return ret;
         }
         ret = esp_ota_set_boot_partition(s_ota_partition);
         if (ret != ESP_OK) {
           log_e("Zigbee - Failed to set OTA boot partition, status: %s", esp_err_to_name(ret));
+          for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+            (*it)->zbOTAState(false);  // Notify that OTA is no longer active
+          }
           return ret;
+        }
+        for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+          (*it)->zbOTAState(false);  // Notify that OTA is no longer active
         }
         log_w("Zigbee - Prepare to restart system");
         esp_restart();
