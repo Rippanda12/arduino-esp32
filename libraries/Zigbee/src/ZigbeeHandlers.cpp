@@ -1,16 +1,26 @@
 /* Zigbee Common Functions */
 #include "ZigbeeCore.h"
 #include "Arduino.h"
+#include <algorithm> 
 
 #if CONFIG_ZB_ENABLED
 
+// #ifndef CONFIG_ZB_DELTA_OTA
+// #define CONFIG_ZB_DELTA_OTA 1
+// #endif
+
 #include "esp_ota_ops.h"
-#if CONFIG_ZB_DELTA_OTA  // Delta OTA, code is prepared for this feature but not enabled by default
-#include "esp_delta_ota_ops.h"
+#if CONFIG_ZB_DELTA_OTA
+#include "esp_delta_ota.h" // Changed from esp_delta_ota_ops.h to esp_delta_ota.h for consistency with main.c and expected API
 #endif
+#include "esp_app_format.h" // Required for esp_image_header_t
 
 //OTA Upgrade defines and variables
 #define OTA_ELEMENT_HEADER_LEN 6 /* OTA element format header size include tag identifier and length field */
+#define PATCH_HEADER_SIZE 64 // Defined in main.c
+#define DIGEST_SIZE 32 // Defined in main.c
+static uint32_t esp_delta_ota_magic = 0xfccdde10; // Defined in main.c
+#define IMG_HEADER_LEN sizeof(esp_image_header_t) // Defined in main.c
 
 /**
  * @name Enumeration for the tag identifier denotes the type and format of the data within the element
@@ -21,8 +31,17 @@ typedef enum esp_ota_element_tag_id_e {
 } esp_ota_element_tag_id_t;
 
 static const esp_partition_t *s_ota_partition = NULL;
+static const esp_partition_t *s_current_partition = NULL; // Added for delta OTA
 static esp_ota_handle_t s_ota_handle = 0;
+#if CONFIG_ZB_DELTA_OTA
+static esp_delta_ota_handle_t s_delta_ota_handle = NULL; // Added for delta OTA
+#endif
 static bool s_tagid_received = false;
+#if CONFIG_ZB_DELTA_OTA
+static size_t patch_header_bytes_received = 0; // Number of bytes received for the patch header
+static bool patch_header_complete = false; // New flag to indicate if the patch header has been fully received and verified
+static uint8_t patch_header_buffer_accumulated[PATCH_HEADER_SIZE]; // Buffer to hold accumulated patch header
+#endif
 
 // forward declaration of all implemented handlers
 static esp_err_t zb_attribute_set_handler(const esp_zb_zcl_set_attr_value_message_t *message);
@@ -35,6 +54,86 @@ static esp_err_t zb_cmd_default_resp_handler(const esp_zb_zcl_cmd_default_resp_m
 static esp_err_t zb_window_covering_movement_resp_handler(const esp_zb_zcl_window_covering_movement_message_t *message);
 static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_value_message_t *message);
 static esp_err_t zb_ota_upgrade_query_image_resp_handler(const esp_zb_zcl_ota_upgrade_query_image_resp_message_t *message);
+
+// Helper functions for Delta OTA (from main.c)
+static bool verify_chip_id(void *bin_header_data)
+{
+    esp_image_header_t *header = (esp_image_header_t *)bin_header_data;
+    if (header->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID) {
+        log_e("Mismatch chip id, expected %d, found %d", CONFIG_IDF_FIRMWARE_CHIP_ID, header->chip_id);
+        return false;
+    }
+    return true;
+}
+
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
+static esp_err_t write_cb(const uint8_t *buf_p, size_t size, void *user_data)
+#else
+static esp_err_t write_cb(const uint8_t *buf_p, size_t size)
+#endif
+{
+    if (size <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    static char header_data[IMG_HEADER_LEN];
+    static bool chip_id_verified = false;
+    static int header_data_read = 0;
+    int index = 0;
+
+    if (!chip_id_verified) {
+        if (header_data_read + size <= IMG_HEADER_LEN) {
+            memcpy(header_data + header_data_read, buf_p, size);
+            header_data_read += size;
+            return ESP_OK;
+        } else {
+            index = IMG_HEADER_LEN - header_data_read;
+            memcpy(header_data + header_data_read, buf_p, index);
+
+            if (!verify_chip_id(header_data)) {
+                return ESP_ERR_INVALID_VERSION;
+            }
+            chip_id_verified = true;
+
+            // Write data in header_data buffer.
+            esp_err_t err = esp_ota_write(s_ota_handle, header_data, IMG_HEADER_LEN);
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
+    }
+    return esp_ota_write(s_ota_handle, buf_p + index, size - index);
+}
+
+static esp_err_t read_cb(uint8_t *buf_p, size_t size, int src_offset)
+{
+    if (size <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_partition_read(s_current_partition, src_offset, buf_p, size);
+}
+
+static bool verify_patch_header(void *img_hdr_data)
+{
+    if (!img_hdr_data) {
+        return false;
+    }
+    uint32_t recv_magic = *(uint32_t *)img_hdr_data;
+    uint8_t *digest = (uint8_t *)(img_hdr_data + 4);
+
+    if (recv_magic != esp_delta_ota_magic) {
+        log_e("Invalid magic word in patch");
+        return false;
+    }
+    uint8_t sha_256[DIGEST_SIZE] = { 0 };
+    esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
+    if (memcmp(sha_256, digest, DIGEST_SIZE) != 0) {
+        log_e("SHA256 of current firmware differs from than in patch header. Invalid patch for current firmware");
+        return false;
+    }
+    return true;
+}
+
 
 // Zigbee action handlers
 [[maybe_unused]]
@@ -240,8 +339,11 @@ static esp_err_t zb_window_covering_movement_resp_handler(const esp_zb_zcl_windo
 
 static esp_err_t esp_element_ota_data(uint32_t total_size, const void *payload, uint16_t payload_size, void **outbuf, uint16_t *outlen) {
   static uint16_t tagid = 0;
-  void *data_buf = NULL;
-  uint16_t data_len;
+  void *current_data_chunk = NULL; // Points to the relevant part of the current Zigbee payload
+  uint16_t current_data_len = 0;   // Length of the relevant part of the current Zigbee payload
+
+  *outbuf = NULL; // Default to no data to process
+  *outlen = 0;    // Default to no data to process
 
   if (!s_tagid_received) {
     uint32_t length = 0;
@@ -260,25 +362,64 @@ static esp_err_t esp_element_ota_data(uint32_t total_size, const void *payload, 
 
     s_tagid_received = true;
 
-    data_buf = (void *)(payload_ptr + OTA_ELEMENT_HEADER_LEN);
-    data_len = payload_size - OTA_ELEMENT_HEADER_LEN;
-  } else {
-    data_buf = (void *)payload;
-    data_len = payload_size;
+    current_data_chunk = (void *)(payload_ptr + OTA_ELEMENT_HEADER_LEN);
+    current_data_len = payload_size - OTA_ELEMENT_HEADER_LEN;
+
+  } else { // s_tagid_received is true (subsequent payloads)
+    current_data_chunk = (void *)payload;
+    current_data_len = payload_size;
   }
 
+#if CONFIG_ZB_DELTA_OTA
+  if (!patch_header_complete) {
+    size_t bytes_needed_for_header = PATCH_HEADER_SIZE - patch_header_bytes_received;
+    size_t bytes_to_copy_to_header = std::min((size_t)current_data_len, bytes_needed_for_header);
+
+    memcpy(patch_header_buffer_accumulated + patch_header_bytes_received, current_data_chunk, bytes_to_copy_to_header);
+    patch_header_bytes_received += bytes_to_copy_to_header;
+
+    if (patch_header_bytes_received < PATCH_HEADER_SIZE) {
+        // Header not yet complete, no data to feed yet
+        return ESP_OK;
+    } else { // Header is now complete (patch_header_bytes_received >= PATCH_HEADER_SIZE)
+        if (verify_patch_header(patch_header_buffer_accumulated)) {
+            log_e("Patch Header verification failed");
+            return ESP_FAIL;
+        }
+        patch_header_complete = true;
+
+        // Calculate the part of current_data_chunk that is actual patch data
+        size_t patch_data_start_offset_in_current_chunk = bytes_to_copy_to_header;
+        size_t patch_data_length_in_current_chunk = current_data_len - patch_data_start_offset_in_current_chunk;
+
+        if (patch_data_length_in_current_chunk > 0) {
+            *outbuf = (void *)((uint8_t *)current_data_chunk + patch_data_start_offset_in_current_chunk);
+            *outlen = patch_data_length_in_current_chunk;
+        }
+        return ESP_OK;
+    }
+  } else { // patch_header_complete is true, so all of current_data_chunk is patch data
+    if (tagid != UPGRADE_IMAGE) { // Sanity check, should always be UPGRADE_IMAGE after header
+      log_e("Unsupported element tag identifier %d after header completion", tagid);
+      return ESP_ERR_INVALID_ARG;
+    }
+    *outbuf = current_data_chunk;
+    *outlen = current_data_len;
+    return ESP_OK;
+  }
+#else // Not CONFIG_ZB_DELTA_OTA
+  // This block is for non-delta OTA, the entire current_data_chunk is always the image data
   switch (tagid) {
     case UPGRADE_IMAGE:
-      *outbuf = data_buf;
-      *outlen = data_len;
+      *outbuf = current_data_chunk;
+      *outlen = current_data_len;
       break;
     default:
       log_e("Unsupported element tag identifier %d", tagid);
       return ESP_ERR_INVALID_ARG;
-      break;
   }
-
   return ESP_OK;
+#endif // CONFIG_ZB_DELTA_OTA
 }
 
 static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_value_message_t *message) {
@@ -288,6 +429,20 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
   static int64_t start_time = 0;
   esp_err_t ret = ESP_OK;
 
+#if CONFIG_ZB_DELTA_OTA
+  // Declare these variables outside the switch to avoid "jump to case label" errors
+  esp_delta_ota_cfg_t cfg = {
+      .read_cb = &read_cb,
+  };
+  #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
+  char *user_data = "zigbee_delta_ota";
+  cfg.write_cb_with_user_data = &write_cb;
+  cfg.user_data = user_data;
+  #else
+  cfg.write_cb = &write_cb;
+  #endif
+#endif
+
   if (message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS) {
     switch (message->upgrade_status) {
       case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
@@ -296,17 +451,42 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
           (*it)->zbOTAState(true);  // Notify that OTA is active
         }
         start_time = esp_timer_get_time();
+        s_current_partition = esp_ota_get_running_partition(); // Get current partition for delta OTA
         s_ota_partition = esp_ota_get_next_update_partition(NULL);
         assert(s_ota_partition);
+
+        if (s_current_partition == NULL || s_ota_partition == NULL) {
+            log_e("Error getting partition information");
+            return ESP_FAIL;
+        }
+
+        if (s_current_partition->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX ||
+                s_ota_partition->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+            log_e("Invalid partition subtype");
+            return ESP_FAIL;
+        }
+
 #if CONFIG_ZB_DELTA_OTA
-        ret = esp_delta_ota_begin(s_ota_partition, 0, &s_ota_handle);
+        patch_header_bytes_received = 0; // Ensure reset on new OTA
+        patch_header_complete = false;   // Ensure reset on new OTA
+        ret = esp_ota_begin(s_ota_partition, OTA_SIZE_UNKNOWN, &s_ota_handle); // Initialize ota_handle first
+        if (ret != ESP_OK) {
+            log_e("Zigbee - Failed to begin OTA partition, status: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        s_delta_ota_handle = esp_delta_ota_init(&cfg); // Use the already declared 'cfg'
+        if (s_delta_ota_handle == NULL) {
+            log_e("Zigbee - delta_ota_init failed");
+            esp_ota_end(s_ota_handle); // Clean up ota_handle
+            return ESP_FAIL;
+        }
 #else
         ret = esp_ota_begin(s_ota_partition, 0, &s_ota_handle);
-#endif
         if (ret != ESP_OK) {
           log_e("Zigbee - Failed to begin OTA partition, status: %s", esp_err_to_name(ret));
           return ret;
         }
+#endif
         break;
       case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
         total_size = message->ota_header.image_size;
@@ -321,7 +501,21 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
             return ret;
           }
 #if CONFIG_ZB_DELTA_OTA
-          ret = esp_delta_ota_write(s_ota_handle, payload, payload_size);
+          if (payload_size > 0 && payload != NULL) { // Only feed if there's actual patch data after header accumulation
+            if (s_delta_ota_handle == NULL) {
+                log_e("Delta OTA handle is not initialized!");
+                return ESP_FAIL;
+            }
+            ret = esp_delta_ota_feed_patch(s_delta_ota_handle, (const uint8_t *)payload, payload_size);
+          } else if (payload_size == 0 && payload == NULL) {
+            // This can happen if the first few fragments only contain the header, and no actual patch data yet.
+            // In this case, esp_element_ota_data returns ESP_OK, but outlen is 0 and outbuf is NULL.
+            // We just continue to wait for more data.
+            return ESP_OK;
+          } else {
+            log_e("Unexpected payload_size or payload state after esp_element_ota_data for delta OTA.");
+            return ESP_FAIL;
+          }
 #else
           ret = esp_ota_write(s_ota_handle, (const void *)payload, payload_size);
 #endif
@@ -340,6 +534,11 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
         offset = 0;
         total_size = 0;
         s_tagid_received = false;
+        // Reset patch header accumulation variables for next OTA
+        #if CONFIG_ZB_DELTA_OTA
+        patch_header_bytes_received = 0;
+        patch_header_complete = false; // Reset the flag
+        #endif
         log_i("Zigbee - OTA upgrade check status: %s", esp_err_to_name(ret));
         break;
       case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
@@ -350,7 +549,23 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
           (esp_timer_get_time() - start_time) / 1000
         );
 #if CONFIG_ZB_DELTA_OTA
-        ret = esp_delta_ota_end(s_ota_handle);
+        ret = esp_delta_ota_finalize(s_delta_ota_handle);
+        if (ret != ESP_OK) {
+            log_e("Zigbee - esp_delta_ota_finalize() failed : %s", esp_err_to_name(ret));
+            for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+              (*it)->zbOTAState(false);  // Notify that OTA is no longer active
+            }
+            return ret;
+        }
+        ret = esp_delta_ota_deinit(s_delta_ota_handle);
+        if (ret != ESP_OK) {
+            log_e("Zigbee - esp_delta_ota_deinit() failed : %s", esp_err_to_name(ret));
+            for (std::list<ZigbeeEP *>::iterator it = Zigbee.ep_objects.begin(); it != Zigbee.ep_objects.end(); ++it) {
+              (*it)->zbOTAState(false);  // Notify that OTA is no longer active
+            }
+            return ret;
+        }
+        ret = esp_ota_end(s_ota_handle);
 #else
         ret = esp_ota_end(s_ota_handle);
 #endif
@@ -374,6 +589,71 @@ static esp_err_t zb_ota_upgrade_status_handler(const esp_zb_zcl_ota_upgrade_valu
         }
         log_w("Zigbee - Prepare to restart system");
         esp_restart();
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT: // Explicitly handle ABORT
+        log_w("Zigbee - OTA upgrade aborted");
+        // Add any necessary cleanup for abort
+        #if CONFIG_ZB_DELTA_OTA
+        if (s_delta_ota_handle) {
+            esp_delta_ota_deinit(s_delta_ota_handle);
+            s_delta_ota_handle = NULL;
+        }
+        #endif
+        if (s_ota_handle) {
+            esp_ota_end(s_ota_handle);
+            s_ota_handle = 0;
+        }
+        s_tagid_received = false;
+        #if CONFIG_ZB_DELTA_OTA
+        patch_header_bytes_received = 0;
+        patch_header_complete = false; // Reset the flag
+        #endif
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK: // Explicitly handle OK (though it's a success status usually ending in FINISH)
+        log_i("Zigbee - OTA upgrade status OK");
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR: // Explicitly handle ERROR
+        log_e("Zigbee - OTA upgrade error");
+        // Add any necessary cleanup for error
+        #if CONFIG_ZB_DELTA_OTA
+        if (s_delta_ota_handle) {
+            esp_delta_ota_deinit(s_delta_ota_handle);
+            s_delta_ota_handle = NULL;
+        }
+        #endif
+        if (s_ota_handle) {
+            esp_ota_end(s_ota_handle);
+            s_ota_handle = 0;
+        }
+        s_tagid_received = false;
+        #if CONFIG_ZB_DELTA_OTA
+        patch_header_bytes_received = 0;
+        patch_header_complete = false; // Reset the flag
+        #endif
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_NORMAL: // Explicitly handle NORMAL
+        log_i("Zigbee - OTA image status normal");
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_BUSY: // Explicitly handle BUSY
+        log_w("Zigbee - OTA upgrade busy");
+        break;
+      case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_SERVER_NOT_FOUND: // Explicitly handle SERVER_NOT_FOUND
+        log_e("Zigbee - OTA server not found");
+        #if CONFIG_ZB_DELTA_OTA
+        if (s_delta_ota_handle) {
+            esp_delta_ota_deinit(s_delta_ota_handle);
+            s_delta_ota_handle = NULL;
+        }
+        #endif
+        if (s_ota_handle) {
+            esp_ota_end(s_ota_handle);
+            s_ota_handle = 0;
+        }
+        s_tagid_received = false;
+        #if CONFIG_ZB_DELTA_OTA
+        patch_header_bytes_received = 0;
+        patch_header_complete = false; // Reset the flag
+        #endif
         break;
       default: log_i("Zigbee - OTA status: %d", message->upgrade_status); break;
     }
